@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 # ── Clients ──────────────────────────────────────────────────────────────────
 genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-gemini = genai.GenerativeModel("gemini-2.0-flash")
+gemini = genai.GenerativeModel("gemini-1.5-flash-8b")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 creds_json = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
