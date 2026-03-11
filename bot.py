@@ -1,10 +1,10 @@
 import os
 import json
 import logging
+import httpx
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from google import genai
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -13,7 +13,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ── Clients ──────────────────────────────────────────────────────────────────
-gemini = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 creds_json = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
@@ -31,45 +32,36 @@ except ValueError:
 # ── AI Parsing ────────────────────────────────────────────────────────────────
 def parse_expense(text: str) -> dict | None:
     today = datetime.now().strftime("%Y-%m-%d")
-    prompt = f"""You are an expense parser. Extract ONE expense from the message and return ONLY a JSON object.
+    prompt = f"""Extract ONE expense from this message and return ONLY a JSON object.
 
 Message: "{text}"
 Today: {today}
 
-Rules:
-- Return ONLY raw JSON, no markdown, no backticks, no explanation
-- "amount" must be a number (not string)
-- "category" must be one of: Food, Transport, Shopping, Entertainment, Health, Bills, Other
-- "date" format: YYYY-MM-DD
-- If no expense found, return {{"amount": null}}
+Return ONLY raw JSON like this example:
+{{"amount": 250, "category": "Food", "description": "lunch", "date": "{today}"}}
 
-Example output: {{"amount": 250, "category": "Food", "description": "lunch", "date": "{today}"}}
+category must be one of: Food, Transport, Shopping, Entertainment, Health, Bills, Other
+If no expense found, return: {{"amount": null}}
+No markdown, no backticks, no explanation. Just JSON."""
 
-JSON:"""
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     try:
-        response = gemini.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=prompt
-        )
-        raw = response.text.strip()
-        logger.info(f"Gemini raw response: {raw}")
+        r = httpx.post(GEMINI_URL, json=payload, timeout=15)
+        r.raise_for_status()
+        raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        logger.info(f"Gemini raw: {raw}")
 
         raw = raw.replace("```json", "").replace("```", "").strip()
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
+        start, end = raw.find("{"), raw.rfind("}") + 1
         if start == -1 or end == 0:
-            logger.error(f"No JSON found in: {raw}")
             return None
-        raw = raw[start:end]
-
-        data = json.loads(raw)
-        logger.info(f"Parsed: {data}")
+        data = json.loads(raw[start:end])
         return data if data.get("amount") else None
 
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON error: {e} | Raw: {raw}")
-        return None
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Gemini HTTP error {e.response.status_code}: {e.response.text}")
+        raise
     except Exception as e:
         logger.error(f"Gemini error: {type(e).__name__}: {e}")
         raise
@@ -142,7 +134,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         expense = parse_expense(text)
     except Exception as e:
-        logger.error(f"Unhandled error: {e}")
         await update.message.reply_text(
             f"⚠️ Error: `{type(e).__name__}: {str(e)[:200]}`",
             parse_mode="Markdown"
