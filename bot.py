@@ -33,26 +33,48 @@ except ValueError:
 # ── AI Parsing ────────────────────────────────────────────────────────────────
 def parse_expense(text: str) -> dict | None:
     today = datetime.now().strftime("%Y-%m-%d")
-    prompt = f"""Extract expense details from this message and return ONLY valid JSON.
+    prompt = f"""You are an expense parser. Extract ONE expense from the message and return ONLY a JSON object.
 
 Message: "{text}"
-Today's date: {today}
+Today: {today}
 
-Return JSON with these exact keys:
-{{
-  "amount": <number or null>,
-  "category": <one of: Food, Transport, Shopping, Entertainment, Health, Bills, Other>,
-  "description": <short string>,
-  "date": <YYYY-MM-DD, use today if not mentioned>
-}}
+Rules:
+- Return ONLY raw JSON, no markdown, no backticks, no explanation
+- "amount" must be a number (not string)
+- "category" must be one of: Food, Transport, Shopping, Entertainment, Health, Bills, Other
+- "date" format: YYYY-MM-DD
+- If no expense found, return {{"amount": null}}
 
-If this is NOT an expense message, return: {{"amount": null}}
-Return ONLY the JSON object, no markdown, no backticks, no extra text."""
+Example output: {{"amount": 250, "category": "Food", "description": "lunch", "date": "{today}"}}
 
-    response = gemini.generate_content(prompt)
-    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-    data = json.loads(raw)
-    return data if data.get("amount") else None
+JSON:"""
+
+    try:
+        response = gemini.generate_content(prompt)
+        raw = response.text.strip()
+        logger.info(f"Gemini raw response: {raw}")
+
+        # Strip any markdown formatting Gemini might add
+        raw = raw.replace("```json", "").replace("```", "").strip()
+
+        # Sometimes Gemini adds text before/after — extract just the JSON object
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start == -1 or end == 0:
+            logger.error(f"No JSON object found in response: {raw}")
+            return None
+        raw = raw[start:end]
+
+        data = json.loads(raw)
+        logger.info(f"Parsed expense: {data}")
+        return data if data.get("amount") else None
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error: {e} | Raw: {raw}")
+        return None
+    except Exception as e:
+        logger.error(f"Gemini error: {type(e).__name__}: {e}")
+        raise
 
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
@@ -117,20 +139,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         await update.message.reply_text("⛔ Unauthorized.")
         return
+
     text = update.message.text.strip()
     await update.message.reply_chat_action("typing")
+
     try:
         expense = parse_expense(text)
     except Exception as e:
-        logger.error(f"Gemini parsing error: {e}")
-        await update.message.reply_text("⚠️ AI parsing failed. Try again in a moment.")
+        logger.error(f"Unhandled parse error: {e}")
+        await update.message.reply_text(
+            f"⚠️ Error: `{type(e).__name__}: {str(e)[:200]}`",
+            parse_mode="Markdown"
+        )
         return
+
     if not expense:
         await update.message.reply_text(
             "🤔 Couldn't find an expense in that message.\nTry: _Spent 300 on dinner_",
             parse_mode="Markdown"
         )
         return
+
     row = append_expense(expense["date"], expense["category"], expense["amount"], expense["description"])
     emoji = _cat_emoji(expense["category"])
     await update.message.reply_text(
