@@ -3,6 +3,9 @@ import json
 import logging
 import httpx
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo('Asia/Kolkata')
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import gspread
@@ -31,21 +34,26 @@ except ValueError:
 
 # ── AI Parsing — returns a LIST of expenses ───────────────────────────────────
 def parse_expenses(text: str) -> list[dict]:
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(IST).strftime("%Y-%m-%d")
     system = "You are an expense parser. Extract ALL expenses and return ONLY a valid JSON array. No markdown, no backticks, no explanation."
-    user = f"""Extract ALL expenses from this message (there may be multiple):
+    user = f"""Extract ALL transactions from this message (there may be multiple):
 "{text}"
 
 Today: {today}
 
-Return a JSON ARRAY. Example for multiple expenses:
+IMPORTANT rules for amount sign:
+- If message starts with + (e.g. "+200 salary") → amount is POSITIVE (income/received)
+- If message starts with - (e.g. "-100 coffee") → amount is NEGATIVE (expense/spent)
+- If no sign prefix → amount is NEGATIVE by default (it's an expense)
+
+Return a JSON ARRAY. Example:
 [
-  {{"amount": 250, "category": "Food", "description": "lunch", "date": "{today}"}},
-  {{"amount": 800, "category": "Food", "description": "groceries", "date": "{today}"}}
+  {{"amount": -250, "category": "Food", "description": "lunch", "date": "{today}"}},
+  {{"amount": 200, "category": "Other", "description": "received cash", "date": "{today}"}}
 ]
 
-category must be one of: Food, Transport, Shopping, Entertainment, Health, Bills, Other
-If NO expenses found, return: []
+category must be one of: Food, Transport, Shopping, Entertainment, Health, Bills, Income, Other
+If NO transactions found, return: []
 Return ONLY the JSON array, nothing else."""
 
     try:
@@ -91,7 +99,7 @@ def ensure_header():
         logger.error(f"Header check error: {e}")
 
 def append_expense(date, category, amount, description) -> int:
-    sheet.append_row([date, category, float(amount), description, datetime.now().strftime("%Y-%m-%d %H:%M")])
+    sheet.append_row([date, category, float(amount), description, datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")])
     return sheet.row_count
 
 def get_summary() -> str:
@@ -111,10 +119,16 @@ def get_summary() -> str:
         except (IndexError, ValueError):
             continue
 
-    lines = [f"📊 *Expense Summary* ({len(data)} entries)\n"]
-    for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1]):
-        lines.append(f"  {_emoji(cat)} {cat}: ₹{amt:,.2f}")
-    lines.append(f"\n💰 *Total: ₹{total:,.2f}*")
+    total_expense = sum(v for v in by_cat.values() if v < 0)
+    total_income = sum(v for v in by_cat.values() if v > 0)
+    lines = [f"📊 *Summary* ({len(data)} entries)\n"]
+    for cat, amt in sorted(by_cat.items(), key=lambda x: x[1]):
+        prefix = "📈" if amt > 0 else _emoji(cat)
+        lines.append(f"  {prefix} {cat}: ₹{abs(amt):,.2f} ({'income' if amt > 0 else 'expense'})")
+    if total_income:
+        lines.append(f"\n📈 *Income: ₹{total_income:,.2f}*")
+    lines.append(f"💸 *Expenses: ₹{abs(total_expense):,.2f}*")
+    lines.append(f"💰 *Net: ₹{total_income + total_expense:,.2f}*")
     return "\n".join(lines)
 
 def _emoji(cat):
@@ -156,7 +170,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["✅ *Expenses logged!*\n"]
     for e in expenses:
         append_expense(e["date"], e["category"], e["amount"], e["description"])
-        lines.append(f"{_emoji(e['category'])} {e['category']}: ₹{float(e['amount']):,.2f} — {e['description']}")
+        amt = float(e['amount'])
+        sign = "📈 Income" if amt > 0 else _emoji(e['category'])
+        lines.append(f"{sign} {e['category']}: ₹{abs(amt):,.2f} — {e['description']}")
 
     lines.append(f"\n📋 {len(expenses)} expense(s) added to your sheet!")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -175,4 +191,4 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    main() 
+    main()
