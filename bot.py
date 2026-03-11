@@ -21,7 +21,10 @@ creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
 gc = gspread.authorize(creds)
 sheet = gc.open_by_key(os.environ["GOOGLE_SHEET_ID"]).sheet1
 
-ALLOWED_USER_ID = int(os.environ.get("ALLOWED_TELEGRAM_USER_ID", "0"))  # 0 = allow all
+try:
+    ALLOWED_USER_ID = int(os.environ.get("ALLOWED_TELEGRAM_USER_ID", "0"))
+except ValueError:
+    ALLOWED_USER_ID = 0  # allow all if value is invalid/placeholder
 
 # ── AI Parsing ────────────────────────────────────────────────────────────────
 def parse_expense(text: str) -> dict | None:
