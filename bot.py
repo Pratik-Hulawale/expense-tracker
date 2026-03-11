@@ -180,11 +180,35 @@ def _groq(messages, max_tokens=500, model="llama-3.1-8b-instant") -> str:
     return r.json()["choices"][0]["message"]["content"].strip()
 
 def _extract_json_list(raw: str) -> list:
+    """Robustly extract a JSON array from messy LLM output."""
+    import re
     raw = raw.replace("```json","").replace("```","").strip()
+
+    # Try direct parse first
+    try:
+        result = json.loads(raw)
+        if isinstance(result, list): return result
+        if isinstance(result, dict): return [result]
+    except Exception:
+        pass
+
+    # Try extracting [...] block
     s, e = raw.find("["), raw.rfind("]") + 1
-    if s == -1 or e == 0:
-        return []
-    return json.loads(raw[s:e])
+    if s != -1 and e > 0:
+        try:
+            return json.loads(raw[s:e])
+        except Exception:
+            pass
+
+    # Try extracting individual {...} objects and wrap in list
+    objects = re.findall(r'\{[^{}]+\}', raw, re.DOTALL)
+    result = []
+    for obj in objects:
+        try:
+            result.append(json.loads(obj))
+        except Exception:
+            pass
+    return result
 
 def parse_expenses(text: str) -> list[dict]:
     today = datetime.now(IST).strftime("%Y-%m-%d")
