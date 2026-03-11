@@ -35,25 +35,25 @@ except ValueError:
 # ── AI Parsing — returns a LIST of expenses ───────────────────────────────────
 def parse_expenses(text: str) -> list[dict]:
     today = datetime.now(IST).strftime("%Y-%m-%d")
-    system = "You are an expense parser. Extract ALL expenses and return ONLY a valid JSON array. No markdown, no backticks, no explanation."
-    user = f"""Extract ALL transactions from this message (there may be multiple):
-"{text}"
+    system = "You are a strict expense parser. Only extract expenses explicitly mentioned with a real numeric amount. Never invent or guess amounts. Return ONLY a valid JSON array."
+    user = f"""Extract expenses from this message ONLY if they contain an explicit numeric amount.
 
+Message: "{text}"
 Today: {today}
 
-IMPORTANT rules for amount sign:
-- If message starts with + (e.g. "+200 salary") → amount is POSITIVE (income/received)
-- If message starts with - (e.g. "-100 coffee") → amount is NEGATIVE (expense/spent)
-- If no sign prefix → amount is NEGATIVE by default (it's an expense)
+STRICT RULES:
+- ONLY log expenses that have a clear number written (e.g. 250, 500, 1200)
+- If the message has NO number in it → return []
+- Single words or phrases with no number (e.g. "Clear", "Hi", "Ok", "Done") → return []
+- Do NOT guess, invent, or assume any amount
 
-Return a JSON ARRAY. Example:
+Return a JSON ARRAY like:
 [
-  {{"amount": -250, "category": "Food", "description": "lunch", "date": "{today}"}},
-  {{"amount": 200, "category": "Other", "description": "received cash", "date": "{today}"}}
+  {{"amount": 250, "category": "Food", "description": "lunch", "date": "{today}"}}
 ]
 
-category must be one of: Food, Transport, Shopping, Entertainment, Health, Bills, Income, Other
-If NO transactions found, return: []
+category must be one of: Food, Transport, Shopping, Entertainment, Health, Bills, Other
+If NO valid expenses found, return: []
 Return ONLY the JSON array, nothing else."""
 
     try:
