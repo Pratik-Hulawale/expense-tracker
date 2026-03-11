@@ -129,8 +129,10 @@ def ensure_header(sheet_name="Sheet1"):
 
 def append_expense(date_str, category, amount, description, sheet_name="Sheet1", entry_type="expense"):
     ws = get_or_create_sheet(sheet_name)
+    # Store positive for income, negative for expense
+    signed = abs(float(amount)) if entry_type == "income" else -abs(float(amount))
     ws.append_row([
-        date_str, category, float(amount), description,
+        date_str, category, signed, description,
         entry_type.capitalize(),
         datetime.now(IST).strftime("%Y-%m-%d %H:%M")
     ])
@@ -275,8 +277,10 @@ def parse_expenses(text: str) -> list[dict]:
 Today: {today}. Only if explicit number present, else return [].
 Format: [{{"amount":250,"category":"Food","description":"lunch","date":"{today}","type":"expense"}}]
 - type must be "income" or "expense"
-- For payments TO someone (e.g. 'paid Person', 'gave money') → type: "expense"
+- For payments TO someone (e.g. 'paid vishal', 'gave money') → type: "expense"
 - For received money (e.g. 'received', 'got paid') → type: "income"
+- description = ONLY the person/item name. NEVER include the number in description.
+  Example: "-1000 vishal" → amount:1000, description:"vishal" (NOT "1000 vishal")
 Categories: Food,Transport,Shopping,Entertainment,Health,Bills,Transfer,Other
 Return [] if nothing found."""}
     ])
@@ -565,8 +569,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📝 *Log entries:*\n"
         "  _Spent 250 on lunch_ or _-250 lunch_\n"
         "  _Received 5000 salary_ or _+5000 salary_\n"
-        "  _-1000 Person_ → 🔴 expense\n"
-        "  _+2000 Person_ → 🟢 income\n"
+        "  _-1000 vishal_ → 🔴 expense\n"
+        "  _+2000 vishal_ → 🟢 income\n"
         "  📸 Send a receipt photo!\n\n"
         "📂 *Sheets:* /sheets\n"
         f"  Active: *{active_sheet_name(uid)}*\n\n"
