@@ -11,7 +11,7 @@ from google.oauth2.service_account import Credentials
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── Groq client (free, no billing needed) ─────────────────────────────────────
+# ── Groq client ───────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -29,20 +29,24 @@ except ValueError:
     ALLOWED_USER_ID = 0
 
 
-# ── AI Parsing ────────────────────────────────────────────────────────────────
-def parse_expense(text: str) -> dict | None:
+# ── AI Parsing — returns a LIST of expenses ───────────────────────────────────
+def parse_expenses(text: str) -> list[dict]:
     today = datetime.now().strftime("%Y-%m-%d")
-    system = "You are an expense parser. Extract expense details and return ONLY valid JSON. No markdown, no backticks, no explanation."
-    user = f"""Extract ONE expense from this message:
+    system = "You are an expense parser. Extract ALL expenses and return ONLY a valid JSON array. No markdown, no backticks, no explanation."
+    user = f"""Extract ALL expenses from this message (there may be multiple):
 "{text}"
 
 Today: {today}
 
-Return ONLY this JSON format:
-{{"amount": 250, "category": "Food", "description": "lunch", "date": "{today}"}}
+Return a JSON ARRAY. Example for multiple expenses:
+[
+  {{"amount": 250, "category": "Food", "description": "lunch", "date": "{today}"}},
+  {{"amount": 800, "category": "Food", "description": "groceries", "date": "{today}"}}
+]
 
 category must be one of: Food, Transport, Shopping, Entertainment, Health, Bills, Other
-If no expense found: {{"amount": null}}"""
+If NO expenses found, return: []
+Return ONLY the JSON array, nothing else."""
 
     try:
         r = httpx.post(
@@ -52,7 +56,7 @@ If no expense found: {{"amount": null}}"""
                 "model": "llama-3.1-8b-instant",
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "temperature": 0.1,
-                "max_tokens": 150,
+                "max_tokens": 500,
             },
             timeout=15,
         )
@@ -61,11 +65,11 @@ If no expense found: {{"amount": null}}"""
         logger.info(f"Groq raw: {raw}")
 
         raw = raw.replace("```json", "").replace("```", "").strip()
-        start, end = raw.find("{"), raw.rfind("}") + 1
+        start, end = raw.find("["), raw.rfind("]") + 1
         if start == -1 or end == 0:
-            return None
-        data = json.loads(raw[start:end])
-        return data if data.get("amount") else None
+            return []
+        expenses = json.loads(raw[start:end])
+        return [e for e in expenses if e.get("amount")]
 
     except httpx.HTTPStatusError as e:
         logger.error(f"Groq HTTP {e.response.status_code}: {e.response.text}")
@@ -76,18 +80,29 @@ If no expense found: {{"amount": null}}"""
 
 
 # ── Sheets helpers ────────────────────────────────────────────────────────────
+def ensure_header():
+    """Make sure header row exists."""
+    try:
+        cell = sheet.cell(1, 1).value
+        if not cell or cell.strip().lower() != "date":
+            sheet.insert_row(["Date", "Category", "Amount", "Description", "Added At"], 1)
+            logger.info("Header row inserted.")
+    except Exception as e:
+        logger.error(f"Header check error: {e}")
+
 def append_expense(date, category, amount, description) -> int:
-    all_rows = sheet.get_all_values()
-    if not all_rows:
-        sheet.append_row(["Date", "Category", "Amount", "Description", "Added At"])
-    sheet.append_row([date, category, amount, description, datetime.now().strftime("%Y-%m-%d %H:%M")])
-    return len(sheet.get_all_values())
+    sheet.append_row([date, category, float(amount), description, datetime.now().strftime("%Y-%m-%d %H:%M")])
+    return sheet.row_count
 
 def get_summary() -> str:
     rows = sheet.get_all_values()
-    if len(rows) <= 1:
+    logger.info(f"Sheet rows: {len(rows)} | First row: {rows[0] if rows else 'empty'}")
+
+    # Skip header row if present
+    data = [r for r in rows if r and r[0].strip().lower() != "date" and r[0].strip() != ""]
+    if not data:
         return "No expenses recorded yet."
-    data = rows[1:]
+
     total, by_cat = 0.0, {}
     for row in data:
         try:
@@ -95,6 +110,7 @@ def get_summary() -> str:
             total += amt; by_cat[cat] = by_cat.get(cat, 0) + amt
         except (IndexError, ValueError):
             continue
+
     lines = [f"📊 *Expense Summary* ({len(data)} entries)\n"]
     for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1]):
         lines.append(f"  {_emoji(cat)} {cat}: ₹{amt:,.2f}")
@@ -110,6 +126,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Expense Tracker Bot*\n\nJust tell me what you spent:\n"
         "• _Spent 250 on lunch_\n• _Paid 500 for uber_\n• _Groceries 1200_\n\n"
+        "You can send multiple expenses in one message!\n\n"
         "Commands:\n/summary – View spending summary\n/help – Show this message",
         parse_mode="Markdown")
 
@@ -117,7 +134,9 @@ async def help_cmd(update, ctx): await start(update, ctx)
 
 async def summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update): return
-    await update.message.reply_text(get_summary(), parse_mode="Markdown")
+    result = get_summary()
+    logger.info(f"Summary result: {result}")
+    await update.message.reply_text(result, parse_mode="Markdown")
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
@@ -125,22 +144,28 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     await update.message.reply_chat_action("typing")
     try:
-        expense = parse_expense(text)
+        expenses = parse_expenses(text)
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: `{type(e).__name__}: {str(e)[:200]}`", parse_mode="Markdown")
         return
-    if not expense:
-        await update.message.reply_text("🤔 Couldn't find an expense.\nTry: _Spent 300 on dinner_", parse_mode="Markdown")
+
+    if not expenses:
+        await update.message.reply_text("🤔 Couldn't find any expenses.\nTry: _Spent 300 on dinner_", parse_mode="Markdown")
         return
-    row = append_expense(expense["date"], expense["category"], expense["amount"], expense["description"])
-    await update.message.reply_text(
-        f"✅ *Expense logged!*\n\n{_emoji(expense['category'])} {expense['category']}: ₹{expense['amount']:,.2f}\n"
-        f"📝 {expense['description']}\n📅 {expense['date']}\n📋 Row #{row}", parse_mode="Markdown")
+
+    lines = ["✅ *Expenses logged!*\n"]
+    for e in expenses:
+        append_expense(e["date"], e["category"], e["amount"], e["description"])
+        lines.append(f"{_emoji(e['category'])} {e['category']}: ₹{float(e['amount']):,.2f} — {e['description']}")
+
+    lines.append(f"\n📋 {len(expenses)} expense(s) added to your sheet!")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 def _allowed(update):
     return ALLOWED_USER_ID == 0 or update.effective_user.id == ALLOWED_USER_ID
 
 def main():
+    ensure_header()
     app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -150,4 +175,4 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    main() 
