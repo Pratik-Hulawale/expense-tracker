@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-import google.generativeai as genai
+from google import genai
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -13,8 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ── Clients ──────────────────────────────────────────────────────────────────
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-gemini = genai.GenerativeModel("gemini-1.5-flash-8b")
+gemini = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 creds_json = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
@@ -26,7 +25,6 @@ _raw_uid = os.environ.get("ALLOWED_TELEGRAM_USER_ID", "").strip()
 try:
     ALLOWED_USER_ID = int(_raw_uid) if _raw_uid else 0
 except ValueError:
-    logger.warning("ALLOWED_TELEGRAM_USER_ID is not a valid number — allowing all users.")
     ALLOWED_USER_ID = 0
 
 
@@ -50,27 +48,27 @@ Example output: {{"amount": 250, "category": "Food", "description": "lunch", "da
 JSON:"""
 
     try:
-        response = gemini.generate_content(prompt)
+        response = gemini.models.generate_content(
+            model="gemini-2.0-flash-lite",
+            contents=prompt
+        )
         raw = response.text.strip()
         logger.info(f"Gemini raw response: {raw}")
 
-        # Strip any markdown formatting Gemini might add
         raw = raw.replace("```json", "").replace("```", "").strip()
-
-        # Sometimes Gemini adds text before/after — extract just the JSON object
         start = raw.find("{")
         end = raw.rfind("}") + 1
         if start == -1 or end == 0:
-            logger.error(f"No JSON object found in response: {raw}")
+            logger.error(f"No JSON found in: {raw}")
             return None
         raw = raw[start:end]
 
         data = json.loads(raw)
-        logger.info(f"Parsed expense: {data}")
+        logger.info(f"Parsed: {data}")
         return data if data.get("amount") else None
 
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error: {e} | Raw: {raw}")
+        logger.error(f"JSON error: {e} | Raw: {raw}")
         return None
     except Exception as e:
         logger.error(f"Gemini error: {type(e).__name__}: {e}")
@@ -139,27 +137,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _allowed(update):
         await update.message.reply_text("⛔ Unauthorized.")
         return
-
     text = update.message.text.strip()
     await update.message.reply_chat_action("typing")
-
     try:
         expense = parse_expense(text)
     except Exception as e:
-        logger.error(f"Unhandled parse error: {e}")
+        logger.error(f"Unhandled error: {e}")
         await update.message.reply_text(
             f"⚠️ Error: `{type(e).__name__}: {str(e)[:200]}`",
             parse_mode="Markdown"
         )
         return
-
     if not expense:
         await update.message.reply_text(
             "🤔 Couldn't find an expense in that message.\nTry: _Spent 300 on dinner_",
             parse_mode="Markdown"
         )
         return
-
     row = append_expense(expense["date"], expense["category"], expense["amount"], expense["description"])
     emoji = _cat_emoji(expense["category"])
     await update.message.reply_text(
