@@ -655,6 +655,59 @@ async def list_recurring(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  {_emoji(r[1])} {r[2]} — ₹{float(r[0]):,.2f} ({r[3]}), next: {r[4]}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+
+async def logs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update): return
+    uid = _uid(update); sn = active_sheet_name(uid)
+    rows = get_data_rows(sn)
+    if not rows:
+        await update.message.reply_text(
+            f"📭 No transactions in *{sn}*.", parse_mode="Markdown")
+        return
+
+    # Optional: filter by n rows — /logs 20 shows last 20
+    limit = 30  # default
+    if ctx.args:
+        try: limit = int(ctx.args[0])
+        except ValueError: pass
+
+    recent = rows[-limit:]  # take last N entries
+    lines  = [f"📋 *Transactions — {sn}* (last {len(recent)} of {len(rows)} total)\n"]
+
+    for r in recent:
+        try:
+            date_str = r[0]
+            cat      = r[1]
+            amt      = abs(float(r[2]))
+            desc     = r[3] if len(r) > 3 else ""
+            etype    = r[4].strip().lower() if len(r) > 4 else "expense"
+            icon     = "🟢" if etype == "income" else "🔴"
+            label    = "+" if etype == "income" else "-"
+            lines.append(
+                f"{icon} `{date_str}` {_emoji(cat)} *{cat}* {label}₹{amt:,.2f}"
+                + (f" — _{desc}_" if desc else "")
+            )
+        except:
+            continue
+
+    # Telegram message limit is 4096 chars — split if needed
+    full_text = "\n".join(lines)
+    if len(full_text) <= 4096:
+        await update.message.reply_text(full_text, parse_mode="Markdown")
+    else:
+        # Send in chunks
+        chunk, chunks = [], []
+        chunk.append(lines[0])  # header
+        for line in lines[1:]:
+            chunk.append(line)
+            if sum(len(l) for l in chunk) > 3800:
+                chunks.append("\n".join(chunk))
+                chunk = []
+        if chunk:
+            chunks.append("\n".join(chunk))
+        for part in chunks:
+            await update.message.reply_text(part, parse_mode="Markdown")
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     ensure_header("Sheet1")
@@ -673,6 +726,7 @@ def main():
     app.add_handler(CommandHandler("setbudget",     set_budget))
     app.add_handler(CommandHandler("recurring",     recurring_cmd))
     app.add_handler(CommandHandler("listrecurring", list_recurring))
+    app.add_handler(CommandHandler("logs", logs_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
