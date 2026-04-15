@@ -4,8 +4,11 @@ import logging
 import httpx
 import base64
 import re
+import time
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
+from typing import Optional, List, Dict, Tuple, Any
+from functools import wraps, lru_cache
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -13,43 +16,123 @@ from telegram.ext import (
 )
 import gspread
 from gspread.utils import rowcol_to_a1
+from gspread.exceptions import APIError, WorksheetNotFound
 from google.oauth2.service_account import Credentials
 from dateutil.relativedelta import relativedelta
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
+# ── Constants ─────────────────────────────────────────────────────────────────
 IST = ZoneInfo("Asia/Kolkata")
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0
+TELEGRAM_MESSAGE_LIMIT = 4096
+DEFAULT_LOGS_LIMIT = 30
+API_TIMEOUT = 30
+GROQ_MODEL_DEFAULT = "llama-3.1-8b-instant"
+GROQ_MODEL_VISION = "llama-3.2-11b-vision-preview"
+VALID_CATEGORIES = frozenset([
+    "Food", "Transport", "Shopping", "Entertainment",
+    "Health", "Bills", "Transfer", "Other"
+])
+VALID_FREQUENCIES = frozenset(["monthly", "weekly", "yearly"])
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
+def get_env_variable(name: str, default: str = "", required: bool = True) -> str:
+    """Safely get environment variable with proper error handling."""
+    value = os.environ.get(name, default).strip()
+    if required and not value:
+        raise ValueError(f"Required environment variable '{name}' is not set")
+    return value
+
+GROQ_API_KEY = get_env_variable("GROQ_API_KEY")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-creds  = Credentials.from_service_account_info(
-    json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"]), scopes=SCOPES)
-gc = gspread.authorize(creds)
-wb = gc.open_by_key(os.environ["GOOGLE_SHEET_ID"])
 
-_raw_uid = os.environ.get("ALLOWED_TELEGRAM_USER_ID", "").strip()
-try:    ALLOWED_USER_ID = int(_raw_uid) if _raw_uid else 0
-except ValueError: ALLOWED_USER_ID = 0
+try:
+    creds_json = json.loads(get_env_variable("GOOGLE_CREDENTIALS_JSON"))
+    creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
+    gc = gspread.authorize(creds)
+    wb = gc.open_by_key(get_env_variable("GOOGLE_SHEET_ID"))
+except (json.JSONDecodeError, ValueError) as e:
+    logger.error(f"Error initializing Google Sheets: {e}")
+    raise
 
-MONTHLY_BUDGET = float(os.environ.get("MONTHLY_BUDGET", "0"))
+_raw_uid = get_env_variable("ALLOWED_TELEGRAM_USER_ID", default="0", required=False)
+try:
+    ALLOWED_USER_ID = int(_raw_uid) if _raw_uid else 0
+except ValueError:
+    logger.warning(f"Invalid ALLOWED_TELEGRAM_USER_ID: {_raw_uid}, defaulting to 0")
+    ALLOWED_USER_ID = 0
+
+try:
+    MONTHLY_BUDGET = float(get_env_variable("MONTHLY_BUDGET", default="0", required=False))
+except ValueError:
+    logger.warning("Invalid MONTHLY_BUDGET, defaulting to 0")
+    MONTHLY_BUDGET = 0.0
 
 # ── Sheet state ───────────────────────────────────────────────────────────────
-RESERVED = {"Recurring", "Meta"}
-HEADER   = ["Date", "Category", "Amount", "Description", "Type", "Added At"]
-_active_sheet: dict[int, str] = {}
+RESERVED = frozenset({"Recurring", "Meta"})
+HEADER = ["Date", "Category", "Amount", "Description", "Type", "Added At"]
+RECURRING_HEADER = ["Amount", "Category", "Description", "Frequency", "Next Date", "Active"]
+_active_sheet: Dict[int, str] = {}
+_worksheet_cache: Dict[str, Tuple[gspread.Worksheet, float]] = {}
+CACHE_TTL = 300  # 5 minutes
 
 def active_sheet_name(uid: int) -> str:
+    """Get the active sheet name for a user."""
     return _active_sheet.get(uid, "Sheet1")
 
-def set_active_sheet(uid: int, name: str):
+def set_active_sheet(uid: int, name: str) -> None:
+    """Set the active sheet for a user."""
+    if not name or not isinstance(name, str):
+        raise ValueError("Sheet name must be a non-empty string")
     _active_sheet[uid] = name
+
+def retry_on_error(max_attempts: int = MAX_RETRIES, delay: float = RETRY_DELAY):
+    """Decorator to retry functions on API errors."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except (APIError, httpx.HTTPError, ConnectionError) as e:
+                    if attempt == max_attempts - 1:
+                        logger.error(f"{func.__name__} failed after {max_attempts} attempts: {e}")
+                        raise
+                    logger.warning(f"{func.__name__} attempt {attempt + 1} failed: {e}. Retrying...")
+                    time.sleep(delay * (attempt + 1))
+            return None
+        return wrapper
+    return decorator
+
+def get_cached_worksheet(name: str) -> Optional[gspread.Worksheet]:
+    """Get a worksheet from cache if available and not expired."""
+    if name in _worksheet_cache:
+        ws, timestamp = _worksheet_cache[name]
+        if time.time() - timestamp < CACHE_TTL:
+            return ws
+    return None
+
+def cache_worksheet(name: str, ws: gspread.Worksheet) -> None:
+    """Cache a worksheet with current timestamp."""
+    _worksheet_cache[name] = (ws, time.time())
+
+def clear_worksheet_cache(name: Optional[str] = None) -> None:
+    """Clear worksheet cache for a specific sheet or all sheets."""
+    if name:
+        _worksheet_cache.pop(name, None)
+    else:
+        _worksheet_cache.clear()
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 COLOR_EXPENSE = {"red": 1.0,  "green": 0.85, "blue": 0.85}  # light red
@@ -57,8 +140,15 @@ COLOR_INCOME  = {"red": 0.85, "green": 1.0,  "blue": 0.85}  # light green
 COLOR_HEADER  = {"red": 0.27, "green": 0.51, "blue": 0.71}  # blue header
 COLOR_WHITE   = {"red": 1.0,  "green": 1.0,  "blue": 1.0}
 
-def color_row(ws: gspread.Worksheet, row_idx: int, is_income: bool):
-    """Color a data row red (expense) or green (income)."""
+@retry_on_error(max_attempts=2, delay=0.5)
+def color_row(ws: gspread.Worksheet, row_idx: int, is_income: bool) -> None:
+    """Color a data row red (expense) or green (income).
+    
+    Args:
+        ws: The worksheet to format
+        row_idx: The row index to color (1-based)
+        is_income: True for income (green), False for expense (red)
+    """
     try:
         color = COLOR_INCOME if is_income else COLOR_EXPENSE
         ws.format(f"A{row_idx}:F{row_idx}", {
@@ -66,10 +156,15 @@ def color_row(ws: gspread.Worksheet, row_idx: int, is_income: bool):
             "textFormat": {"fontSize": 10}
         })
     except Exception as e:
-        logger.warning(f"Color row failed: {e}")
+        logger.warning(f"Failed to color row {row_idx}: {e}")
 
-def setup_sheet_formatting(ws: gspread.Worksheet):
-    """Apply header formatting and freeze top row."""
+@retry_on_error(max_attempts=2, delay=0.5)
+def setup_sheet_formatting(ws: gspread.Worksheet) -> None:
+    """Apply header formatting and freeze top row.
+    
+    Args:
+        ws: The worksheet to format
+    """
     try:
         ws.format("A1:F1", {
             "backgroundColor": COLOR_HEADER,
@@ -83,78 +178,227 @@ def setup_sheet_formatting(ws: gspread.Worksheet):
             }
         }]})
     except Exception as e:
-        logger.warning(f"Sheet formatting failed: {e}")
+        logger.warning(f"Sheet formatting failed for '{ws.title}': {e}")
 
 # ── Sheet helpers ─────────────────────────────────────────────────────────────
+@retry_on_error()
 def get_or_create_sheet(name: str) -> gspread.Worksheet:
+    """Get an existing worksheet or create a new one with proper headers.
+    
+    Args:
+        name: The name of the worksheet
+        
+    Returns:
+        The worksheet object
+        
+    Raises:
+        ValueError: If name is empty or invalid
+    """
+    if not name or not isinstance(name, str):
+        raise ValueError("Sheet name must be a non-empty string")
+    
+    # Check cache first
+    cached = get_cached_worksheet(name)
+    if cached:
+        return cached
+    
     try:
-        return wb.worksheet(name)
-    except gspread.WorksheetNotFound:
+        ws = wb.worksheet(name)
+        cache_worksheet(name, ws)
+        return ws
+    except WorksheetNotFound:
+        logger.info(f"Creating new sheet: {name}")
         ws = wb.add_worksheet(title=name, rows=1000, cols=10)
+        
         if name not in RESERVED:
             ws.append_row(HEADER)
             setup_sheet_formatting(ws)
         elif name == "Recurring":
-            ws.append_row(["Amount", "Category", "Description", "Frequency", "Next Date", "Active"])
-        logger.info(f"Created sheet: {name}")
+            ws.append_row(RECURRING_HEADER)
+            
+        cache_worksheet(name, ws)
+        logger.info(f"Successfully created sheet: {name}")
         return ws
 
-def list_expense_sheets() -> list[str]:
-    return [ws.title for ws in wb.worksheets() if ws.title not in RESERVED]
+@retry_on_error()
+def list_expense_sheets() -> List[str]:
+    """Get all non-reserved worksheet names.
+    
+    Returns:
+        List of sheet names excluding reserved sheets
+    """
+    try:
+        return [ws.title for ws in wb.worksheets() if ws.title not in RESERVED]
+    except Exception as e:
+        logger.error(f"Failed to list sheets: {e}")
+        return ["Sheet1"]
 
+@retry_on_error()
 def rename_sheet(old: str, new: str) -> bool:
-    if old in RESERVED or new in RESERVED:
+    """Rename a worksheet.
+    
+    Args:
+        old: Current sheet name
+        new: New sheet name
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not old or not new:
+        logger.warning("Sheet names cannot be empty")
         return False
+    if old in RESERVED or new in RESERVED:
+        logger.warning(f"Cannot rename reserved sheets: {old} -> {new}")
+        return False
+    if old == new:
+        return True
+        
     try:
         wb.worksheet(old).update_title(new)
+        clear_worksheet_cache(old)
+        logger.info(f"Renamed sheet: {old} -> {new}")
         return True
     except Exception as e:
-        logger.error(f"Rename error: {e}"); return False
-
-def delete_sheet(name: str) -> bool:
-    if name in RESERVED or name == "Sheet1":
+        logger.error(f"Rename error ({old} -> {new}): {e}")
         return False
+
+@retry_on_error()
+def delete_sheet(name: str) -> bool:
+    """Delete a worksheet if not protected.
+    
+    Args:
+        name: Sheet name to delete
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not name:
+        return False
+    if name in RESERVED or name == "Sheet1":
+        logger.warning(f"Cannot delete protected sheet: {name}")
+        return False
+        
     try:
         wb.del_worksheet(wb.worksheet(name))
+        clear_worksheet_cache(name)
+        logger.info(f"Deleted sheet: {name}")
         return True
     except Exception as e:
-        logger.error(f"Delete error: {e}"); return False
+        logger.error(f"Delete error for {name}: {e}")
+        return False
 
-def ensure_header(sheet_name="Sheet1"):
-    ws = get_or_create_sheet(sheet_name)
-    cell = ws.cell(1, 1).value
-    if not cell or cell.strip().lower() != "date":
-        ws.insert_row(HEADER, 1)
-        setup_sheet_formatting(ws)
+@retry_on_error()
+def ensure_header(sheet_name: str = "Sheet1") -> None:
+    """Ensure a sheet has the proper header row.
+    
+    Args:
+        sheet_name: Name of the sheet to check
+    """
+    try:
+        ws = get_or_create_sheet(sheet_name)
+        cell = ws.cell(1, 1).value
+        if not cell or cell.strip().lower() != "date":
+            ws.insert_row(HEADER, 1)
+            setup_sheet_formatting(ws)
+            logger.info(f"Added header to sheet: {sheet_name}")
+    except Exception as e:
+        logger.error(f"Failed to ensure header for {sheet_name}: {e}")
 
-def append_expense(date_str, category, amount, description, sheet_name="Sheet1", entry_type="expense"):
+@retry_on_error()
+def append_expense(
+    date_str: str,
+    category: str,
+    amount: float,
+    description: str,
+    sheet_name: str = "Sheet1",
+    entry_type: str = "expense"
+) -> None:
+    """Append an expense or income entry to a sheet.
+    
+    Args:
+        date_str: Date in YYYY-MM-DD format
+        category: Category name
+        amount: Transaction amount (positive)
+        description: Transaction description
+        sheet_name: Target sheet name
+        entry_type: 'expense' or 'income'
+    """
+    # Validate inputs
+    if not date_str or not category or amount < 0:
+        raise ValueError("Invalid expense data")
+    
+    if entry_type not in ("expense", "income"):
+        logger.warning(f"Invalid entry_type: {entry_type}, defaulting to expense")
+        entry_type = "expense"
+    
     ws = get_or_create_sheet(sheet_name)
     # Store positive for income, negative for expense
     signed = abs(float(amount)) if entry_type == "income" else -abs(float(amount))
-    ws.append_row([
-        date_str, category, signed, description,
+    
+    row_data = [
+        date_str,
+        category,
+        signed,
+        description,
         entry_type.capitalize(),
         datetime.now(IST).strftime("%Y-%m-%d %H:%M")
-    ])
+    ]
+    
+    ws.append_row(row_data)
+    
     # Color the newly added row
     row_idx = len(ws.get_all_values())
     color_row(ws, row_idx, is_income=(entry_type == "income"))
+    
+    logger.info(f"Added {entry_type}: {category} ₹{amount} to {sheet_name}")
 
-def get_data_rows(sheet_name="Sheet1") -> list:
-    ws = get_or_create_sheet(sheet_name)
-    return [r for r in ws.get_all_values()
-            if r and r[0].strip().lower() != "date" and r[0].strip()]
+@retry_on_error()
+def get_data_rows(sheet_name: str = "Sheet1") -> List[List[str]]:
+    """Get all data rows from a sheet (excluding header).
+    
+    Args:
+        sheet_name: Name of the sheet
+        
+    Returns:
+        List of data rows
+    """
+    try:
+        ws = get_or_create_sheet(sheet_name)
+        all_rows = ws.get_all_values()
+        return [
+            r for r in all_rows
+            if r and r[0].strip().lower() != "date" and r[0].strip()
+        ]
+    except Exception as e:
+        logger.error(f"Failed to get data rows from {sheet_name}: {e}")
+        return []
 
-def delete_last_row(sheet_name="Sheet1"):
-    ws = get_or_create_sheet(sheet_name)
-    rows = ws.get_all_values()
-    data = [(i+1, r) for i, r in enumerate(rows)
-            if r and r[0].strip().lower() != "date" and r[0].strip()]
-    if not data:
+@retry_on_error()
+def delete_last_row(sheet_name: str = "Sheet1") -> Optional[List[str]]:
+    """Delete the last data row from a sheet.
+    
+    Args:
+        sheet_name: Name of the sheet
+        
+    Returns:
+        The deleted row data, or None if no rows to delete
+    """
+    try:
+        ws = get_or_create_sheet(sheet_name)
+        rows = ws.get_all_values()
+        data = [
+            (i+1, r) for i, r in enumerate(rows)
+            if r and r[0].strip().lower() != "date" and r[0].strip()
+        ]
+        if not data:
+            return None
+        row_idx, row = data[-1]
+        ws.delete_rows(row_idx)
+        logger.info(f"Deleted row {row_idx} from {sheet_name}")
+        return row
+    except Exception as e:
+        logger.error(f"Failed to delete last row from {sheet_name}: {e}")
         return None
-    row_idx, row = data[-1]
-    ws.delete_rows(row_idx)
-    return row
 
 # ── Budget helpers ────────────────────────────────────────────────────────────
 def get_month_total(sheet_name="Sheet1"):
@@ -224,36 +468,112 @@ def process_due_recurring(sheet_name="Sheet1") -> list[str]:
     return logged
 
 # ── AI helpers ────────────────────────────────────────────────────────────────
-def _groq(messages, max_tokens=500, model="llama-3.1-8b-instant") -> str:
-    r = httpx.post(GROQ_URL,
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        json={"model": model, "messages": messages, "temperature": 0.1, "max_tokens": max_tokens},
-        timeout=20)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+def sanitize_input(text: str, max_length: int = 1000) -> str:
+    """Sanitize user input for AI processing.
+    
+    Args:
+        text: Input text to sanitize
+        max_length: Maximum allowed length
+        
+    Returns:
+        Sanitized text
+    """
+    if not text:
+        return ""
+    # Truncate if too long
+    text = text[:max_length]
+    # Remove potential injection patterns
+    text = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F]', '', text)
+    return text.strip()
 
-def _extract_json_list(raw: str) -> list:
-    raw = raw.replace("```json","").replace("```","").strip()
+@retry_on_error(max_attempts=2, delay=1.0)
+def _groq(
+    messages: List[Dict[str, Any]],
+    max_tokens: int = 500,
+    model: str = GROQ_MODEL_DEFAULT
+) -> str:
+    """Make a request to Groq API with retry logic.
+    
+    Args:
+        messages: List of message dictionaries
+        max_tokens: Maximum tokens in response
+        model: Model name to use
+        
+    Returns:
+        Response text from the API
+        
+    Raises:
+        httpx.HTTPError: If the request fails after retries
+    """
+    try:
+        response = httpx.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "temperature": 0.1,
+                "max_tokens": max_tokens
+            },
+            timeout=API_TIMEOUT
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"].strip()
+    except (httpx.HTTPError, KeyError, IndexError) as e:
+        logger.error(f"Groq API error: {e}")
+        raise
+
+def _extract_json_list(raw: str) -> List[Dict[str, Any]]:
+    """Extract JSON objects from a string that may contain markdown or extra text.
+    
+    Args:
+        raw: Raw string potentially containing JSON
+        
+    Returns:
+        List of extracted JSON objects
+    """
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    
+    # Try parsing the whole string as JSON first
     try:
         result = json.loads(raw)
-        if isinstance(result, list): return result
-        if isinstance(result, dict): return [result]
-    except: pass
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return [result]
+    except json.JSONDecodeError:
+        pass
+    
+    # Try finding JSON array
     s, e = raw.find("["), raw.rfind("]") + 1
     if s != -1 and e > 0:
-        try: return json.loads(raw[s:e])
-        except: pass
+        try:
+            return json.loads(raw[s:e])
+        except json.JSONDecodeError:
+            pass
+    
+    # Extract individual JSON objects
     objects = re.findall(r'\{[^{}]+\}', raw, re.DOTALL)
     result = []
     for obj in objects:
-        try: result.append(json.loads(obj))
-        except: pass
+        try:
+            result.append(json.loads(obj))
+        except json.JSONDecodeError:
+            continue
+    
     return result
 
-def detect_sign_prefix(text: str):
-    """
-    Check if message starts with + or - to force income/expense.
-    Returns (cleaned_text, forced_type) where forced_type is 'income', 'expense', or None.
+def detect_sign_prefix(text: str) -> Tuple[str, Optional[str]]:
+    """Check if message starts with + or - to force income/expense.
+    
+    Args:
+        text: Input text to check
+        
+    Returns:
+        Tuple of (cleaned_text, forced_type) where forced_type is 'income', 'expense', or None
     """
     t = text.strip()
     if t.startswith("+"):
@@ -262,8 +582,20 @@ def detect_sign_prefix(text: str):
         return t[1:].strip(), "expense"
     return t, None
 
-def parse_expenses(text: str) -> list[dict]:
-    """Parse text, respecting +/- prefix for income/expense."""
+def parse_expenses(text: str) -> List[Dict[str, Any]]:
+    """Parse text to extract expense/income entries using AI.
+    
+    Args:
+        text: User input text
+        
+    Returns:
+        List of expense/income entry dictionaries
+    """
+    # Sanitize input
+    text = sanitize_input(text)
+    if not text:
+        return []
+    
     cleaned, forced_type = detect_sign_prefix(text)
     today = datetime.now(IST).strftime("%Y-%m-%d")
 
@@ -271,9 +603,10 @@ def parse_expenses(text: str) -> list[dict]:
     if not re.search(r'\d', cleaned):
         return []
 
-    raw = _groq([
-        {"role": "system", "content": "Expense/income parser. Extract entries with explicit numeric amounts. Return ONLY a JSON array."},
-        {"role": "user", "content": f"""Extract ALL entries from: "{cleaned}"
+    try:
+        raw = _groq([
+            {"role": "system", "content": "Expense/income parser. Extract entries with explicit numeric amounts. Return ONLY a JSON array."},
+            {"role": "user", "content": f"""Extract ALL entries from: "{cleaned}"
 Today: {today}. Only if explicit number present, else return [].
 Format: [{{"amount":250,"category":"Food","description":"lunch","date":"{today}","type":"expense"}}]
 - type must be "income" or "expense"
@@ -281,49 +614,82 @@ Format: [{{"amount":250,"category":"Food","description":"lunch","date":"{today}"
 - For received money (e.g. 'received', 'got paid') → type: "income"
 - description = ONLY the person/item name. NEVER include the number in description.
   Example: "-1000 Person" → amount:1000, description:"Person" (NOT "1000 Person")
-Categories: Food,Transport,Shopping,Entertainment,Health,Bills,Transfer,Other
+Categories: {', '.join(VALID_CATEGORIES)}
 Return [] if nothing found."""}
-    ])
-    entries = [x for x in _extract_json_list(raw) if x.get("amount")]
+        ])
+        entries = [x for x in _extract_json_list(raw) if x.get("amount")]
 
-    # Override type if user used +/- prefix
-    if forced_type:
-        for e in entries:
-            e["type"] = forced_type
+        # Override type if user used +/- prefix
+        if forced_type:
+            for e in entries:
+                e["type"] = forced_type
 
-    return entries
+        return entries
+    except Exception as e:
+        logger.error(f"Failed to parse expenses from text: {e}")
+        return []
 
-def parse_receipt_image(image_bytes: bytes) -> list[dict]:
-    today = datetime.now(IST).strftime("%Y-%m-%d")
-    b64   = base64.b64encode(image_bytes).decode()
-    raw   = _groq([{"role": "user", "content": [
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-        {"type": "text", "text": f"Receipt/bill. Extract ALL items. Today:{today}. Return ONLY JSON: [{{\"amount\":250,\"category\":\"Food\",\"description\":\"item\",\"date\":\"{today}\",\"type\":\"expense\"}}]. Return [] if not receipt."}
-    ]}], model="llama-3.2-11b-vision-preview")
-    return [x for x in _extract_json_list(raw) if x.get("amount")]
+def parse_receipt_image(image_bytes: bytes) -> List[Dict[str, Any]]:
+    """Parse a receipt image to extract expense entries using AI vision.
+    
+    Args:
+        image_bytes: Image data as bytes
+        
+    Returns:
+        List of expense entry dictionaries
+    """
+    if not image_bytes:
+        return []
+    
+    try:
+        today = datetime.now(IST).strftime("%Y-%m-%d")
+        b64 = base64.b64encode(image_bytes).decode()
+        raw = _groq(
+            [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": f"Receipt/bill. Extract ALL items. Today:{today}. Return ONLY JSON: [{{\"amount\":250,\"category\":\"Food\",\"description\":\"item\",\"date\":\"{today}\",\"type\":\"expense\"}}]. Return [] if not receipt."}
+            ]}],
+            model=GROQ_MODEL_VISION
+        )
+        return [x for x in _extract_json_list(raw) if x.get("amount")]
+    except Exception as e:
+        logger.error(f"Failed to parse receipt image: {e}")
+        return []
 
 # ── Report builder ────────────────────────────────────────────────────────────
-def build_report(label: str, rows: list, sheet_name="Sheet1") -> str:
+def build_report(label: str, rows: List[List[str]], sheet_name: str = "Sheet1") -> str:
+    """Build a formatted expense/income report.
+    
+    Args:
+        label: Report label (e.g., "Weekly", "Monthly")
+        rows: Data rows to process
+        sheet_name: Name of the sheet
+        
+    Returns:
+        Formatted report string
+    """
     if not rows:
         return f"No entries in *{label}*."
 
-    expenses_by_cat: dict[str, float] = {}
-    income_by_cat:   dict[str, float] = {}
+    expenses_by_cat: Dict[str, float] = {}
+    income_by_cat: Dict[str, float] = {}
     total_expense = 0.0
-    total_income  = 0.0
+    total_income = 0.0
 
     for row in rows:
         try:
-            amt  = abs(float(row[2]))
-            cat  = row[1]
+            amt = abs(float(row[2]))
+            cat = row[1]
             etype = row[4].strip().lower() if len(row) > 4 else "expense"
             if etype == "income":
-                income_by_cat[cat]   = income_by_cat.get(cat, 0) + amt
+                income_by_cat[cat] = income_by_cat.get(cat, 0) + amt
                 total_income += amt
             else:
                 expenses_by_cat[cat] = expenses_by_cat.get(cat, 0) + amt
                 total_expense += amt
-        except: continue
+        except (ValueError, IndexError) as e:
+            logger.warning(f"Skipping invalid row in report: {e}")
+            continue
 
     lines = [f"📊 *{label}* — _{sheet_name}_ ({len(rows)} entries)\n"]
 
@@ -350,14 +716,47 @@ def build_report(label: str, rows: list, sheet_name="Sheet1") -> str:
 
     return "\n".join(lines)
 
-def _emoji(cat):
-    return {"Food":"🍔","Transport":"🚗","Shopping":"🛍️","Entertainment":"🎬",
-            "Health":"💊","Bills":"📄","Transfer":"💸"}.get(cat, "📌")
+@lru_cache(maxsize=10)
+def _emoji(cat: str) -> str:
+    """Get emoji for a category.
+    
+    Args:
+        cat: Category name
+        
+    Returns:
+        Emoji string
+    """
+    emoji_map = {
+        "Food": "🍔",
+        "Transport": "🚗",
+        "Shopping": "🛍️",
+        "Entertainment": "🎬",
+        "Health": "💊",
+        "Bills": "📄",
+        "Transfer": "💸"
+    }
+    return emoji_map.get(cat, "📌")
 
 def _allowed(update: Update) -> bool:
+    """Check if user is authorized to use the bot.
+    
+    Args:
+        update: Telegram update object
+        
+    Returns:
+        True if authorized, False otherwise
+    """
     return ALLOWED_USER_ID == 0 or update.effective_user.id == ALLOWED_USER_ID
 
 def _uid(update: Update) -> int:
+    """Get user ID from update.
+    
+    Args:
+        update: Telegram update object
+        
+    Returns:
+        User ID
+    """
     return update.effective_user.id
 
 # ── /sheets menu ──────────────────────────────────────────────────────────────
