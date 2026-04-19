@@ -19,7 +19,8 @@ from gspread.utils import rowcol_to_a1
 from gspread.exceptions import APIError, WorksheetNotFound
 from google.oauth2.service_account import Credentials
 from dateutil.relativedelta import relativedelta
-
+from dotenv import load_dotenv
+load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
